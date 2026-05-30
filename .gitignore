@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.DS_Store
+*.log
+
+# large raw data (~96MB) — share out-of-band, not via git
+datasets/
+# generated cache artifacts (e.g. world.npz from Person 1)
+artifacts/
+
+# large binary voice model (~60MB) — share out-of-band, not via git
+*.onnx
+audio/clips/

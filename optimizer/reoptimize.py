@@ -1,0 +1,228 @@
+"""
+re_optimize — Person 2's single public entry point (CONTRACTS.md).
+
+    re_optimize(state, world, constraints) -> OptimizeResult
+
+Person 3 calls this each time the sim wants a relocation decision. It:
+  1. evaluates current coverage,
+  2. builds + solves the relocation MILP on the GPU (cuOpt),
+  3. decodes the unit->station assignment into a list of moves,
+  4. evaluates the post-move coverage,
+  5. returns the OptimizeResult shape the LLM explains.
+"""
+from __future__ import annotations
+
+from copy import deepcopy
+from typing import Optional
+
+import contracts as C
+from optimizer.evaluate import evaluate
+from optimizer.milp import build_milp
+
+
+def _reloc_min(world: C.World, src: int, dst: int) -> float:
+    """Real graph-based station->station relocation drive time (minutes), from
+    Person 1's cuGraph station_travel matrix (diagonal 0)."""
+    return float(world["station_travel"][src, dst])
+
+
+def _decode(x, build, state: C.State, world: C.World,
+            coverage_before: C.CoverageMap):
+    """Read a cuOpt primal solution back into a post-move State and move list."""
+    after = deepcopy(state)
+    after_by_id = {u["unit_id"]: u for u in after["units"]}
+    moves: list[dict] = []
+    for u in range(build.U):
+        uid = build.avail_unit_ids[u]
+        home = build.home_station[u]
+        chosen = max(range(build.S), key=lambda s: x[build.xi(u, s)])
+        after_by_id[uid]["station"] = chosen
+        if chosen != home:
+            eta = _reloc_min(world, home, chosen)
+            moves.append({
+                "unit_id": uid,
+                "from": home,
+                "to": chosen,
+                "eta_min": round(eta, 1),
+                "reason": _move_reason(chosen, world, coverage_before, eta),
+            })
+    return after, moves
+
+
+def _normalize_status(reason: str) -> str:
+    r = (reason or "").lower()
+    if "optimal" in r:
+        return "Optimal"
+    if "infeasible" in r:
+        return "Infeasible"
+    if "feasible" in r:
+        return "Feasible"
+    return "Error" if ("error" in r or not reason) else reason
+
+
+def re_optimize(
+    state: C.State,
+    world: C.World,
+    constraints: Optional[C.Constraints] = None,
+) -> C.OptimizeResult:
+    from cuopt.linear_programming import solver
+    from cuopt.linear_programming.solver_settings import SolverSettings
+
+    rc = C.resolve_constraints(constraints, world)
+    coverage_before = evaluate(state, world, rc["threshold_min"])
+
+    build = build_milp(state, world, rc)
+
+    # Nothing to decide (no available units) -> no-op result.
+    if build.U == 0 or build.data_model is None:
+        return {
+            "moves": [], "coverage_before": coverage_before,
+            "coverage_after": coverage_before, "objective": 0.0,
+            "solve_time_ms": 0.0, "status": "Optimal", "n_moves": 0,
+        }
+
+    settings = SolverSettings()
+    settings.set_parameter("log_to_console", False)
+    sol = solver.Solve(build.data_model, settings)
+
+    status = _normalize_status(sol.get_termination_reason())
+    solve_ms = float(sol.get_solve_time()) * 1000.0
+
+    if status == "Infeasible":
+        return {
+            "moves": [], "coverage_before": coverage_before,
+            "coverage_after": coverage_before, "objective": 0.0,
+            "solve_time_ms": solve_ms, "status": "Infeasible", "n_moves": 0,
+        }
+
+    x = sol.get_primal_solution()
+
+    # ---- decode assignment -> moves & post-move state ------------------- #
+    after, moves = _decode(x, build, state, world, coverage_before)
+
+    coverage_after = evaluate(after, world, rc["threshold_min"])
+    return {
+        "moves": moves,
+        "coverage_before": coverage_before,
+        "coverage_after": coverage_after,
+        "objective": float(sol.get_primal_objective()),
+        "solve_time_ms": solve_ms,
+        "status": status,
+        "n_moves": len(moves),
+    }
+
+
+def _move_reason(to_station: int, world: C.World, before: C.CoverageMap,
+                 eta_min: float) -> str:
+    """Tag the move with the highest-demand gap zone the destination can cover,
+    plus the real relocation ETA so the rationale is decision-grade."""
+    gaps = set(before["gaps"])
+    best_fsa, best_dem = None, -1.0
+    for z in range(world["Z"]):
+        fsa = world["fsa_index"][z]
+        if fsa in gaps and world["coverage"][to_station, z]:
+            d = world["fsa_meta"][z]["demand_weight"]
+            if d > best_dem:
+                best_dem, best_fsa = d, fsa
+    what = f"cover_gap:{best_fsa}" if best_fsa else "rebalance"
+    return f"{what} ({eta_min:.1f} min reloc)"
+
+
+def re_optimize_robust(
+    state: C.State,
+    world: C.World,
+    constraints: Optional[C.Constraints] = None,
+    n_scenarios: int = 8,
+    n_score: int = 500_000,
+    concentration: float = 30.0,
+    seed: int = 0,
+) -> C.OptimizeResult:
+    """Robust relocation under demand uncertainty — the GPU-filling optimizer.
+
+    Instead of one deterministic solve, build a PORTFOLIO of MILPs — one for the
+    historical demand plus `n_scenarios` sampled demand realizations — and solve
+    them together with cuOpt BatchSolve (parallel on the GPU). Each solve yields
+    a candidate placement; we then score all candidates (plus a do-nothing
+    baseline) against `n_score` fresh demand scenarios with the Monte Carlo
+    ranking engine and return the placement that is most robust on average.
+
+    Returns the standard OptimizeResult shape (so Person 3's loop / LLM are
+    unchanged), with an extra `robust` block describing the portfolio.
+    """
+    import numpy as np
+    from cuopt.linear_programming.solver import BatchSolve
+    from cuopt.linear_programming.solver_settings import SolverSettings
+
+    from optimizer.montecarlo import _demand_base, rank_plans, sample_demand
+
+    rc = C.resolve_constraints(constraints, world)
+    coverage_before = evaluate(state, world, rc["threshold_min"])
+
+    probe = build_milp(state, world, rc)
+    if probe.U == 0 or probe.data_model is None:
+        return {
+            "moves": [], "coverage_before": coverage_before,
+            "coverage_after": coverage_before, "objective": 0.0,
+            "solve_time_ms": 0.0, "status": "Optimal", "n_moves": 0,
+            "robust": {"chosen_plan": "do_nothing", "n_plans_scored": 1,
+                       "n_scenarios_solved": 0, "batch_solve_ms": 0.0,
+                       "ranking": []},
+        }
+
+    # demand portfolio: historical + sampled scenarios
+    samp = sample_demand(world, n_scenarios, concentration, seed)
+    try:
+        import cupy as cp
+        samp = cp.asnumpy(samp)
+    except Exception:
+        samp = np.asarray(samp)
+
+    overrides = [None] + [samp[i] for i in range(n_scenarios)]   # None => historical
+    sc_labels = ["deterministic"] + [f"scenario_{i + 1}" for i in range(n_scenarios)]
+    builds = [build_milp(state, world, rc, demand_override=o) for o in overrides]
+
+    settings = SolverSettings()
+    settings.set_parameter("log_to_console", False)
+    sols, batch_s = BatchSolve([b.data_model for b in builds], settings)
+    batch_ms = float(batch_s) * 1000.0
+
+    # candidate placements: do-nothing baseline + every feasible solve
+    plans: list[C.State] = [state]
+    plan_labels: list[str] = ["do_nothing"]
+    plan_moves: list[list[dict]] = [[]]
+    for i, sol in enumerate(sols):
+        if _normalize_status(sol.get_termination_reason()) == "Infeasible":
+            continue
+        after, moves = _decode(sol.get_primal_solution(), builds[i],
+                               state, world, coverage_before)
+        plans.append(after); plan_labels.append(sc_labels[i]); plan_moves.append(moves)
+
+    # rank by robust expected coverage over FRESH scenarios (seed+1) to avoid
+    # rewarding a plan just for fitting the draws it was optimized on.
+    rk = rank_plans(plans, world, n_scenarios=n_score, concentration=concentration,
+                    threshold_min=rc["threshold_min"], seed=seed + 1, labels=plan_labels)
+    best = rk["best"]
+    bi = best["index"]
+    after = plans[bi]
+    moves = plan_moves[bi]
+    coverage_after = evaluate(after, world, rc["threshold_min"])
+
+    return {
+        "moves": moves,
+        "coverage_before": coverage_before,
+        "coverage_after": coverage_after,
+        "objective": float(best["expected_coverage_pct"]),
+        "solve_time_ms": batch_ms,
+        "status": "Optimal",
+        "n_moves": len(moves),
+        "robust": {
+            "chosen_plan": plan_labels[bi],
+            "expected_coverage_pct": float(best["expected_coverage_pct"]),
+            "p5": float(best["p5"]), "p95": float(best["p95"]),
+            "n_plans_scored": len(plans),
+            "n_scenarios_solved": n_scenarios,
+            "score_scenarios": int(n_score),
+            "batch_solve_ms": batch_ms,
+            "ranking": rk["ranking"][:5],
+        },
+    }
