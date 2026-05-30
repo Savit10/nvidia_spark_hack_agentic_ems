@@ -81,10 +81,38 @@ class Simulation:
         self._schedule_next_call()
 
     # ----------------------------------------------------------------- setup
+    def _station_score(self) -> np.ndarray:
+        """Per-station value = total historical demand it can cover within threshold.
+
+        Vector (S,). Stations that reach lots of busy zones score high; remote
+        stations covering only quiet zones score low. Drives initial placement.
+        """
+        cov = self.world["coverage"].astype("float64")          # (S, Z)
+        return cov @ self.demand                                # (S,)
+
     def _init_units(self, n_units: int) -> list[C.Unit]:
-        """Spread units across distinct stations (round-robin over s-index)."""
+        """Place units by historical demand, not blindly round-robin.
+
+        Greedy load-balanced fill: each unit goes to the station maximizing
+        score / (1 + units_already_there). High-demand stations therefore attract
+        more units, but the diminishing 1/(1+k) term keeps clustering in check, so
+        quiet stations still get a unit or two — exactly the low-priority coverage a
+        dispatcher command can later pull away to reinforce a hotspot.
+
+        Deterministic given the world (ties broken by lowest s-index), so demos
+        reproduce. Falls back to round-robin only if scores are all zero.
+        """
         S = self.world["S"]
-        homes = [i % S for i in range(n_units)]
+        score = self._station_score()
+        if not np.any(score > 0):                               # degenerate world
+            homes = [i % S for i in range(n_units)]
+        else:
+            counts = np.zeros(S, dtype=int)
+            homes = []
+            for _ in range(n_units):
+                s = int(np.argmax(score / (1.0 + counts)))
+                homes.append(s)
+                counts[s] += 1
         return [
             {
                 "unit_id": f"AMB_{i:02d}",

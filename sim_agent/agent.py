@@ -82,10 +82,30 @@ _CONSTRAINTS_SCHEMA = {
         "force_station": {"type": "object", "additionalProperties": {"type": "integer"}},
         "max_moves": {"type": ["integer", "null"]},
         "protect_zones": {"type": "array", "items": {"type": "string"}},
+        "forbid_zones": {"type": "array", "items": {"type": "string"}},
+        "zone_priority": {"type": "object", "additionalProperties": {"type": "number"}},
         "threshold_min": {"type": ["number", "null"]},
         "move_penalty": {"type": ["number", "null"]},
     },
 }
+
+# How the operator's intent maps onto the levers. Soft steering (zone_priority)
+# is the default; the hard levers are reserved for explicitly absolute language.
+_INTENT_GUIDE = (
+    "\nMapping the dispatcher's intent to fields:\n"
+    "- INCREASE / boost / prioritize coverage in a zone (SOFT, preferred): add the "
+    "FSA to zone_priority with a multiplier > 1 (≈2-3; use a bigger number for "
+    "stronger wording). The optimizer will pull units toward it.\n"
+    "- REDUCE / ease off / lower priority / it's quiet in a zone (SOFT, preferred): "
+    "add the FSA to zone_priority with a multiplier < 1 (≈0.2-0.5). Units there "
+    "become cheap to relocate, so they get freed to cover busier areas.\n"
+    "- HARD guarantee only when the language is absolute ('must stay covered', "
+    "'guarantee', 'no matter what'): put the FSA in protect_zones.\n"
+    "- HARD vacate only for absolute language ('evacuate', 'clear out', 'pull "
+    "everyone out of'): put the FSA in forbid_zones.\n"
+    "Default to the soft zone_priority lever; reach for protect_zones/forbid_zones "
+    "only when the operator clearly demands an absolute guarantee.\n"
+)
 
 
 def parse_command(text: str, world: C.World) -> C.Constraints:
@@ -107,7 +127,8 @@ def _parse_command_nim(text: str, world: C.World) -> C.Constraints:
         "Constraints object for a relocation optimizer. Respond with ONLY the "
         "JSON object, no prose. Schema:\n"
         + json.dumps(_CONSTRAINTS_SCHEMA)
-        + "\nOmit fields the command does not mention. "
+        + _INTENT_GUIDE
+        + "Omit fields the command does not mention. "
         "Resolve station names and FSA postal codes using this glossary:\n"
         + json.dumps(glossary)
     )
@@ -137,10 +158,35 @@ def _parse_command_rules(text: str, world: C.World) -> C.Constraints:
     if m:
         c["max_moves"] = int(m.group(1))
 
-    if any(w in low for w in ("cover", "protect", "ensure", "make sure")):
-        zones = [z for z in _FSA_RE.findall(text) if z in valid_fsa]
-        if zones:
+    # Directional zone steering. We classify the whole command's intent, then
+    # apply it to every FSA mentioned. Hard levers (guarantee/evacuate) win over
+    # soft ones (boost/ease-off) when both sets of keywords appear.
+    zones = [z for z in _FSA_RE.findall(text) if z in valid_fsa]
+    if zones:
+        hard_cover = any(w in low for w in (
+            "guarantee", "must stay covered", "must be covered", "no matter what",
+            "protect", "make sure", "ensure",
+        ))
+        hard_vacate = any(w in low for w in (
+            "evacuate", "clear out", "pull everyone", "pull all units",
+            "vacate", "abandon",
+        ))
+        boost = any(w in low for w in (
+            "increase", "boost", "more coverage", "prioritize", "priority",
+            "focus", "reinforce", "cover",
+        ))
+        ease = any(w in low for w in (
+            "reduce", "ease off", "less coverage", "lower", "deprioritize",
+            "it's quiet", "its quiet", "quiet", "pull back", "thin out",
+        ))
+
+        if hard_vacate:
+            c["forbid_zones"] = zones
+        elif hard_cover:
             c["protect_zones"] = zones
+        elif boost or ease:
+            mult = 0.3 if ease and not boost else 3.0
+            c["zone_priority"] = {z: mult for z in zones}
 
     m = re.search(r"within\s+(\d+(?:\.\d+)?)\s*min", low) or re.search(
         r"(\d+(?:\.\d+)?)\s*[- ]?min(?:ute)?\s+threshold", low
@@ -213,6 +259,22 @@ def _coerce_constraints(obj: dict, world: C.World) -> C.Constraints:
     zones = [str(z) for z in _as_list(obj.get("protect_zones")) if str(z) in valid_fsa]
     if zones:
         out["protect_zones"] = zones
+
+    forbid = [str(z) for z in _as_list(obj.get("forbid_zones")) if str(z) in valid_fsa]
+    if forbid:
+        out["forbid_zones"] = forbid
+
+    # zone_priority: {FSA: multiplier}. Keep only valid FSAs with a positive,
+    # non-default multiplier; clamp to a sane band so an LLM can't emit a
+    # multiplier that swamps or zeroes the whole objective.
+    if isinstance(obj.get("zone_priority"), dict):
+        zp = {}
+        for k, v in obj["zone_priority"].items():
+            fv = _as_float(v)
+            if str(k) in valid_fsa and fv is not None and fv > 0 and fv != 1.0:
+                zp[str(k)] = min(max(fv, 0.05), 10.0)
+        if zp:
+            out["zone_priority"] = zp
 
     thr = _as_float(obj.get("threshold_min"))
     if thr is not None:

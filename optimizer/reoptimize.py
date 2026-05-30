@@ -27,7 +27,7 @@ def _reloc_min(world: C.World, src: int, dst: int) -> float:
 
 
 def _decode(x, build, state: C.State, world: C.World,
-            coverage_before: C.CoverageMap):
+            coverage_before: C.CoverageMap, rc: Optional[dict] = None):
     """Read a cuOpt primal solution back into a post-move State and move list."""
     after = deepcopy(state)
     after_by_id = {u["unit_id"]: u for u in after["units"]}
@@ -44,7 +44,7 @@ def _decode(x, build, state: C.State, world: C.World,
                 "from": home,
                 "to": chosen,
                 "eta_min": round(eta, 1),
-                "reason": _move_reason(chosen, world, coverage_before, eta),
+                "reason": _move_reason(chosen, world, coverage_before, eta, rc),
             })
     return after, moves
 
@@ -98,7 +98,7 @@ def re_optimize(
     x = sol.get_primal_solution()
 
     # ---- decode assignment -> moves & post-move state ------------------- #
-    after, moves = _decode(x, build, state, world, coverage_before)
+    after, moves = _decode(x, build, state, world, coverage_before, rc)
 
     coverage_after = evaluate(after, world, rc["threshold_min"])
     return {
@@ -113,18 +113,51 @@ def re_optimize(
 
 
 def _move_reason(to_station: int, world: C.World, before: C.CoverageMap,
-                 eta_min: float) -> str:
-    """Tag the move with the highest-demand gap zone the destination can cover,
-    plus the real relocation ETA so the rationale is decision-grade."""
-    gaps = set(before["gaps"])
-    best_fsa, best_dem = None, -1.0
+                 eta_min: float, rc: Optional[dict] = None) -> str:
+    """Explain a relocation, crediting the operator's command when it drove it.
+
+    Priority of rationale (most operator-relevant first):
+      1. a protected zone the destination now covers   -> protect:FSA
+      2. a boosted zone (zone_priority>1) it covers     -> boost:FSA
+      3. the highest-demand coverage gap it heals        -> cover_gap:FSA
+      4. otherwise                                       -> rebalance
+    The real relocation ETA is always appended so the tag is decision-grade.
+    """
+    rc = rc or {}
+    protect = set(rc.get("protect_zones", []))
+    zpri = rc.get("zone_priority", {})
+    covers = lambda z: world["coverage"][to_station, z]
+
+    what = None
+    # 1. honoring a hard protect
     for z in range(world["Z"]):
         fsa = world["fsa_index"][z]
-        if fsa in gaps and world["coverage"][to_station, z]:
-            d = world["fsa_meta"][z]["demand_weight"]
-            if d > best_dem:
-                best_dem, best_fsa = d, fsa
-    what = f"cover_gap:{best_fsa}" if best_fsa else "rebalance"
+        if fsa in protect and covers(z):
+            what = f"protect:{fsa}"
+            break
+    # 2. serving a soft boost (pick the most-boosted demand it reaches)
+    if what is None and zpri:
+        best_fsa, best_w = None, 0.0
+        for z in range(world["Z"]):
+            fsa = world["fsa_index"][z]
+            mult = zpri.get(fsa, 1.0)
+            if mult > 1.0 and covers(z):
+                w = world["fsa_meta"][z]["demand_weight"] * mult
+                if w > best_w:
+                    best_w, best_fsa = w, fsa
+        if best_fsa:
+            what = f"boost:{best_fsa}"
+    # 3. healing the biggest demand gap
+    if what is None:
+        gaps = set(before["gaps"])
+        best_fsa, best_dem = None, -1.0
+        for z in range(world["Z"]):
+            fsa = world["fsa_index"][z]
+            if fsa in gaps and covers(z):
+                d = world["fsa_meta"][z]["demand_weight"]
+                if d > best_dem:
+                    best_dem, best_fsa = d, fsa
+        what = f"cover_gap:{best_fsa}" if best_fsa else "rebalance"
     return f"{what} ({eta_min:.1f} min reloc)"
 
 
@@ -194,11 +227,16 @@ def re_optimize_robust(
         if _normalize_status(sol.get_termination_reason()) == "Infeasible":
             continue
         after, moves = _decode(sol.get_primal_solution(), builds[i],
-                               state, world, coverage_before)
+                               state, world, coverage_before, rc)
         plans.append(after); plan_labels.append(sc_labels[i]); plan_moves.append(moves)
 
     # rank by robust expected coverage over FRESH scenarios (seed+1) to avoid
     # rewarding a plan just for fitting the draws it was optimized on.
+    # NOTE: operator zone_priority/forbid steer candidate GENERATION (each build_milp
+    # sees the reweighted demand), but this ranking scores on base historical demand,
+    # so a low-demand boosted zone may not win the final pick here. The loop uses the
+    # simple re_optimize() above, which honors zone_priority directly; to also honor it
+    # in the robust pick, weight rank_plans/sample_demand by zone_priority (TODO).
     rk = rank_plans(plans, world, n_scenarios=n_score, concentration=concentration,
                     threshold_min=rc["threshold_min"], seed=seed + 1, labels=plan_labels)
     best = rk["best"]

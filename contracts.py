@@ -63,7 +63,9 @@ class Constraints(TypedDict, total=False):
     lock_units: list[str]
     force_station: dict[str, int]
     max_moves: Optional[int]
-    protect_zones: list[str]
+    protect_zones: list[str]           # HARD: zone must be covered (y[z] forced to 1)
+    forbid_zones: list[str]            # HARD: zone coverage not rewarded (y[z] forced to 0)
+    zone_priority: dict[str, float]    # SOFT: per-FSA demand multiplier (>1 boost, <1 ease off; default 1.0)
     threshold_min: Optional[float]
     move_penalty: Optional[float]
     max_reloc_min: Optional[float]     # hard cap: a unit may not relocate farther than this (drive min)
@@ -132,6 +134,8 @@ def resolve_constraints(c: Optional[Constraints], world: World) -> dict:
         "force_station": dict(c.get("force_station", {})),
         "max_moves": c.get("max_moves", None),
         "protect_zones": list(c.get("protect_zones", [])),
+        "forbid_zones": list(c.get("forbid_zones", [])),
+        "zone_priority": dict(c.get("zone_priority", {})),
         "threshold_min": c.get("threshold_min") or world["threshold_min"],
         "move_penalty": c.get("move_penalty") if c.get("move_penalty") is not None
         else DEFAULT_MOVE_PENALTY,

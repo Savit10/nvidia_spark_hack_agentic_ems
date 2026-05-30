@@ -117,6 +117,16 @@ def build_milp(state: C.State, world: C.World, constraints: dict,
         obj[US:] = np.asarray(demand_override, dtype="float64")            # y reward
     else:
         obj[US:] = [world["fsa_meta"][z]["demand_weight"] for z in range(Z)]
+
+    # SOFT operator steering: scale each zone's demand reward by zone_priority
+    # (>1 boost, <1 ease off; default 1.0). Applied on top of the historical OR
+    # scenario demand above, so the operator's priority carries through every
+    # robust scenario — boosted zones pull units in, eased zones free them.
+    zpri = constraints["zone_priority"]
+    if zpri:
+        mult = np.array([zpri.get(world["fsa_index"][z], 1.0) for z in range(Z)],
+                        dtype="float64")
+        obj[US:] *= mult
     # x penalty: clip to the cap for a bounded coefficient; far/unreachable moves
     # are forbidden by bounds below, so the clip never hides them. Home move free.
     obj_x = -penalty_coef * (np.minimum(reloc_uS, reloc_cap) / familiar_min)   # (U,S)
@@ -205,10 +215,23 @@ def build_milp(state: C.State, world: C.World, constraints: dict,
 
     # protect_zones: force coverage  (y[z] = 1 -> link forces a covering unit)
     fsa_to_z = {world["fsa_index"][z]: z for z in range(Z)}
-    for fsa in constraints["protect_zones"]:
+    protected = set(constraints["protect_zones"])
+    for fsa in protected:
         z = fsa_to_z.get(fsa)
         if z is not None:
             lb[build.yi(z)] = 1.0
+
+    # forbid_zones (HARD): drop the coverage reward for these zones (y[z] = 0), so
+    # the optimizer won't park a unit there for their sake — freeing it to cover
+    # demand elsewhere. A zone both protected and forbidden is contradictory;
+    # protect wins (skip the forbid) so the model stays feasible.
+    for fsa in constraints["forbid_zones"]:
+        if fsa in protected:
+            build.notes.append(f"{fsa} both protected and forbidden; honoring protect")
+            continue
+        z = fsa_to_z.get(fsa)
+        if z is not None:
+            ub[build.yi(z)] = 0.0
 
     # ---- assemble cuOpt DataModel --------------------------------------- #
     dm = DataModel()

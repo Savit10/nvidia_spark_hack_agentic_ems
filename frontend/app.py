@@ -133,17 +133,37 @@ loop: Loop = st.session_state.loop
 last = st.session_state.get("last")
 
 st.title("Ambulance Relocation — live coverage")
-cmd = st.text_input("Dispatcher command (plain English, optional)",
-                    placeholder="e.g. Make sure M4T stays covered and don't make more than 2 moves")
+cmd = st.text_input(
+    "Dispatcher command (plain English, optional)",
+    placeholder="e.g. Increase coverage around M5V, it's quiet out in M1B — pull from there",
+    help="Soft steering: 'boost/increase coverage in M5V', 'ease off M1B' (reweights "
+         "priorities, units redirect from quiet zones to busy ones). "
+         "Hard levers: 'guarantee M4T stays covered' (must-cover), "
+         "'evacuate M1B' (vacate). Also: 'no more than 2 moves', 'keep AMB_03', "
+         "'use a 7 minute threshold'.")
 # relocation policy from the sidebar sliders; a typed command can still override
 base_constraints = {"max_reloc_min": max_reloc, "familiar_min": familiar}
+
+
+def _spinner_msg(has_cmd: bool) -> str:
+    """What the spinner says while a Step runs. Calls out the LLM stage when an
+    operator command is being interpreted (Nemotron NIM, or the rule fallback)."""
+    if has_cmd:
+        engine = "Nemotron NIM" if nim else "rule parser"
+        return (f"🧠 Agent thinking — interpreting your command ({engine}), "
+                f"optimizing relocations, and writing the explanation…")
+    return "⚙️ Advancing the sim and optimizing relocations…"
+
+
 b1, b2, b3 = st.columns([1, 1, 1])
 if b1.button("▶ Step (advance + optimize)", type="primary", use_container_width=True):
-    st.session_state.last = loop.step(command=cmd or None, base_constraints=base_constraints)
+    with st.spinner(_spinner_msg(bool(cmd and cmd.strip()))):
+        st.session_state.last = loop.step(command=cmd or None, base_constraints=base_constraints)
     last = st.session_state.last
 if b2.button("⏩ Step ×5", use_container_width=True):
-    for _ in range(5):
-        st.session_state.last = loop.step(base_constraints=base_constraints)
+    with st.spinner("⚙️ Running 5 steps and optimizing relocations…"):
+        for _ in range(5):
+            st.session_state.last = loop.step(base_constraints=base_constraints)
     last = st.session_state.last
 if b3.button("↺ Reset", use_container_width=True):
     st.session_state.sig = None
@@ -165,9 +185,11 @@ with st.container(border=True):
             disabled = not (asr_up and wav.exists())
             if st.button(clip["label"], key=f"clip_{clip['id']}", disabled=disabled,
                          use_container_width=True):
-                raw = transcribe_bytes(wav.read_bytes())
-                norm = normalize_dispatch_text(raw, world)
-                st.session_state.last = loop.step(command=norm, base_constraints=base_constraints)
+                with st.spinner("🎧 Transcribing dispatch audio (local ASR), then "
+                                "interpreting the command and optimizing relocations…"):
+                    raw = transcribe_bytes(wav.read_bytes())
+                    norm = normalize_dispatch_text(raw, world)
+                    st.session_state.last = loop.step(command=norm, base_constraints=base_constraints)
                 st.session_state.last_audio = {"label": clip["label"], "raw": raw, "norm": norm}
                 last = st.session_state.last
     la = st.session_state.get("last_audio")
