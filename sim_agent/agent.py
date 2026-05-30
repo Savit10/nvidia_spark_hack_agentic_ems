@@ -309,10 +309,13 @@ def _coerce_constraints(obj: dict, world: C.World) -> C.Constraints:
 # --------------------------------------------------------------------------- #
 #  6b. OptimizeResult -> English explanation
 # --------------------------------------------------------------------------- #
-def explain_result(result: C.OptimizeResult, world: C.World) -> str:
-    """2-4 sentence operator-facing explanation of a relocation result."""
+def explain_result(result: C.OptimizeResult, world: C.World, use_llm: bool = True) -> str:
+    """2-4 sentence operator-facing explanation of a relocation result.
+
+    `use_llm=False` forces the instant template (skips the Nemotron round-trip) —
+    used for fast auto-play ticks; the LLM is reserved for operator commands."""
     payload = _explain_payload(result, world)
-    if nim_available():
+    if use_llm and nim_available():
         try:
             return _explain_nim(payload)
         except Exception:
@@ -345,14 +348,51 @@ def _explain_payload(result: C.OptimizeResult, world: C.World) -> dict:
         "after_pct": after,
         "gaps_healed": healed,
         "solve_time_ms": result["solve_time_ms"],
+        "reasoning": result.get("reasoning"),
+        "notes": result.get("notes", []),
     }
+
+
+def _coverage_story(p: dict) -> str:
+    """Plain-English account of how each operator-commanded zone got covered.
+
+    Resolves the common confusion 'why didn't a unit move INTO the zone?': a zone
+    is covered when an available unit is within the response-time threshold of it,
+    which is usually a nearby post rather than the zone itself.
+    """
+    r = p.get("reasoning")
+    if not r or not r.get("zones"):
+        return ""
+    thr = r["threshold_min"]
+    bits = []
+    for z in r["zones"]:
+        fsa, by = z["fsa"], z.get("covered_by")
+        if z["covered_after"] and by:
+            verb = "now covered" if not z["covered_before"] else "stays covered"
+            how = (f"{by['unit']} {'moved to' if by['moved'] else 'is posted at'} "
+                   f"{by['station']}, {by['dist_min']:.0f} min from {fsa}")
+            delta = (f" (response {z['before_min']:.0f}→{z['after_min']:.0f} min)"
+                     if z["covered_before"] is False else "")
+            bits.append(f"{fsa} {verb}: {how}{delta}")
+        else:
+            bits.append(f"{fsa} still uncovered — nearest unit {z['after_min']:.0f} min "
+                        f"away (beyond the {thr:.0f}-min standard)")
+    note_txt = (" " + " ".join(p.get("notes", []))) if p.get("notes") else ""
+    return (" ".join(b + "." for b in bits)
+            + f" (‘Covered’ means an available unit within {thr:.0f} min, "
+            f"not a unit parked inside the zone.)" + note_txt)
 
 
 def _explain_nim(payload: dict) -> str:
     system = (
         "You are an ambulance dispatch assistant. Given a JSON relocation result, "
         "write a concise 2-4 sentence explanation for the operator: what to move, "
-        "and how coverage improves. Plain text, no JSON, no markdown."
+        "and how coverage improves. If a `reasoning` block is present, explain for "
+        "each commanded zone HOW it became covered — name the unit, its post, and how "
+        "many minutes it sits from the zone — and make clear that a zone is 'covered' "
+        "when an available unit is within the response threshold of it, not when a "
+        "unit is parked inside it. If a zone is still uncovered or a `notes` entry "
+        "explains a relaxed limit, say so plainly. Plain text, no JSON, no markdown."
     )
     return _chat(
         [
@@ -371,9 +411,11 @@ def _explain_template(p: dict) -> str:
             "constraints or add a unit."
         )
     if p["n_moves"] == 0:
+        story = _coverage_story(p)
+        story = (" " + story) if story else ""
         return (
             f"No moves needed: coverage is already at {p['before_pct']*100:.0f}% "
-            f"of demand. (solved in {p['solve_time_ms']:.0f} ms)"
+            f"of demand.{story} (solved in {p['solve_time_ms']:.0f} ms)"
         )
     parts = [
         f"{m['unit']}: {m['from']} → {m['to']} (~{m['eta_min']:.0f} min, {m['reason']})"
@@ -386,11 +428,13 @@ def _explain_template(p: dict) -> str:
         if p["gaps_healed"]
         else ""
     )
+    story = _coverage_story(p)
+    story = (" " + story) if story else ""
     return (
         f"Recommend {p['n_moves']} move(s): "
         + "; ".join(parts)
         + f". Demand coverage rises {p['before_pct']*100:.0f}% → "
-        f"{p['after_pct']*100:.0f}%.{healed} "
+        f"{p['after_pct']*100:.0f}%.{healed}{story} "
         f"(solved in {p['solve_time_ms']:.0f} ms)"
     )
 

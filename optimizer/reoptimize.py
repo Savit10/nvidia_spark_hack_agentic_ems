@@ -92,6 +92,54 @@ def _reloc_need(state: C.State, world: C.World, rc: dict, fsas) -> tuple[Optiona
     return (max(needs) if needs else None), uncoverable
 
 
+def _coverage_reasoning(state: C.State, after: C.State, world: C.World, rc: dict,
+                        cov_before: C.CoverageMap, cov_after: C.CoverageMap):
+    """Explain HOW each operator-commanded zone ended up covered (or not).
+
+    The thing operators find confusing is that a zone is 'covered' when ANY
+    available unit is within threshold_min of it — not when a unit is parked
+    inside it. So for each commanded zone we report which available unit now
+    covers it, from which post, how far (min), whether that unit moved this step,
+    and the before/after response time. The loop/UI turns this into plain English.
+    """
+    commanded = list(dict.fromkeys(list(rc["protect_zones"])
+                     + [z for z, m in rc["zone_priority"].items() if m > 1.0]))
+    if not commanded:
+        return None
+    tt = world["travel_time"]
+    name = lambda s: world["station_meta"][s]["name"]
+    fsa_to_z = {world["fsa_index"][z]: z for z in range(world["Z"])}
+    before_pos = {u["unit_id"]: u["station"] for u in state["units"]}
+    avail_after = [u for u in after["units"] if u["status"] == "available"]
+
+    zones = []
+    for fsa in commanded:
+        z = fsa_to_z.get(fsa)
+        if z is None:
+            continue
+        pb = cov_before["per_zone"].get(fsa, {})
+        pa = cov_after["per_zone"].get(fsa, {})
+        # the available unit now closest to this zone is the one "covering" it
+        best = min(avail_after, key=lambda u: float(tt[u["station"], z]), default=None)
+        by = None
+        if best is not None:
+            by = {
+                "unit": best["unit_id"],
+                "station": name(best["station"]),
+                "dist_min": round(float(tt[best["station"], z]), 1),
+                "moved": before_pos.get(best["unit_id"]) != best["station"],
+            }
+        zones.append({
+            "fsa": fsa,
+            "covered_before": bool(pb.get("covered", False)),
+            "covered_after": bool(pa.get("covered", False)),
+            "before_min": round(float(pb.get("nearest_unit_min", 0.0)), 1),
+            "after_min": round(float(pa.get("nearest_unit_min", 0.0)), 1),
+            "covered_by": by,
+        })
+    return {"threshold_min": rc["threshold_min"], "zones": zones}
+
+
 def _solve_once(state: C.State, world: C.World, rc: dict) -> C.OptimizeResult:
     """Build + solve the relocation MILP for one fully-resolved constraint set."""
     from cuopt.linear_programming import solver
@@ -116,10 +164,13 @@ def _solve_once(state: C.State, world: C.World, rc: dict) -> C.OptimizeResult:
                 "solve_time_ms": solve_ms, "status": "Infeasible", "n_moves": 0, "notes": []}
 
     after, moves = _decode(sol.get_primal_solution(), build, state, world, coverage_before, rc)
+    coverage_after = evaluate(after, world, rc["threshold_min"])
     return {"moves": moves, "coverage_before": coverage_before,
-            "coverage_after": evaluate(after, world, rc["threshold_min"]),
+            "coverage_after": coverage_after,
             "objective": float(sol.get_primal_objective()), "solve_time_ms": solve_ms,
-            "status": status, "n_moves": len(moves), "notes": []}
+            "status": status, "n_moves": len(moves), "notes": [],
+            "reasoning": _coverage_reasoning(state, after, world, rc,
+                                             coverage_before, coverage_after)}
 
 
 def re_optimize(
