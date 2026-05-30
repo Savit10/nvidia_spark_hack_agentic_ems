@@ -158,35 +158,54 @@ def _parse_command_rules(text: str, world: C.World) -> C.Constraints:
     if m:
         c["max_moves"] = int(m.group(1))
 
-    # Directional zone steering. We classify the whole command's intent, then
-    # apply it to every FSA mentioned. Hard levers (guarantee/evacuate) win over
-    # soft ones (boost/ease-off) when both sets of keywords appear.
-    zones = [z for z in _FSA_RE.findall(text) if z in valid_fsa]
-    if zones:
-        hard_cover = any(w in low for w in (
-            "guarantee", "must stay covered", "must be covered", "no matter what",
-            "protect", "make sure", "ensure",
-        ))
-        hard_vacate = any(w in low for w in (
-            "evacuate", "clear out", "pull everyone", "pull all units",
-            "vacate", "abandon",
-        ))
-        boost = any(w in low for w in (
-            "increase", "boost", "more coverage", "prioritize", "priority",
-            "focus", "reinforce", "cover",
-        ))
-        ease = any(w in low for w in (
-            "reduce", "ease off", "less coverage", "lower", "deprioritize",
-            "it's quiet", "its quiet", "quiet", "pull back", "thin out",
-        ))
+    # Directional zone steering, parsed PER CLAUSE so a mixed command like
+    # "boost M4T and ease off M1B" keeps the two directions separate (instead of
+    # collapsing to one). Coverage verbs ("cover"/"make sure"/"guarantee") map to the
+    # HARD protect lever, so the optimizer redirects units as needed to actually cover
+    # the zone — re_optimize escalates the relocation cap to honor it, or explains why
+    # it can't. Milder "boost"/"prioritize" stay on the soft zone_priority lever.
+    HARD_VACATE = ("evacuate", "clear out", "pull everyone", "pull all units",
+                   "vacate", "abandon")
+    EASE = ("ease off", "reduce", "less coverage", "less", "lower", "deprioritize",
+            "quiet", "pull back", "thin out", "slow", "calm")
+    HARD_COVER = ("guarantee", "make sure", "ensure", "must", "no matter what",
+                  "protect", "cover", "covered", "coverage", "keep", "critical",
+                  "slammed", "swamped")
+    BOOST = ("boost", "increase", "prioritize", "priority", "more units",
+             "more ambulance", "send more", "focus", "reinforce", "lean")
 
-        if hard_vacate:
-            c["forbid_zones"] = zones
-        elif hard_cover:
-            c["protect_zones"] = zones
-        elif boost or ease:
-            mult = 0.3 if ease and not boost else 3.0
-            c["zone_priority"] = {z: mult for z in zones}
+    def _clause_dir(cl: str):
+        if any(w in cl for w in HARD_VACATE):
+            return "vacate"
+        if any(w in cl for w in EASE):
+            return "ease"
+        if any(w in cl for w in HARD_COVER):
+            return "cover"
+        if any(w in cl for w in BOOST):
+            return "boost"
+        return None
+
+    last_dir = None
+    for clause in re.split(r"\b(?:and|but|then|also|while|;|,)\b", text):
+        d = _clause_dir(clause.lower())
+        if d:
+            last_dir = d
+        czones = [z for z in _FSA_RE.findall(clause) if z in valid_fsa]
+        if not czones:
+            continue
+        use = d or last_dir or "cover"          # a bare "...M5V" defaults to coverage intent
+        if use == "vacate":
+            c.setdefault("forbid_zones", []).extend(czones)
+        elif use == "cover":
+            c.setdefault("protect_zones", []).extend(czones)
+        elif use == "ease":
+            c.setdefault("zone_priority", {}).update({z: 0.3 for z in czones})
+        else:  # boost
+            c.setdefault("zone_priority", {}).update({z: 3.0 for z in czones})
+
+    for k in ("forbid_zones", "protect_zones"):     # de-dupe, preserve order
+        if k in c:
+            c[k] = list(dict.fromkeys(c[k]))
 
     m = re.search(r"within\s+(\d+(?:\.\d+)?)\s*min", low) or re.search(
         r"(\d+(?:\.\d+)?)\s*[- ]?min(?:ute)?\s+threshold", low

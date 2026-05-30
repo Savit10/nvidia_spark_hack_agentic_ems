@@ -155,15 +155,25 @@ def _spinner_msg(has_cmd: bool) -> str:
     return "⚙️ Advancing the sim and optimizing relocations…"
 
 
+def _done_label(tr) -> str:
+    n = tr.result["n_moves"] if (tr and tr.result) else 0
+    return f"✅ Done — {n} relocation(s) computed"
+
+
 b1, b2, b3 = st.columns([1, 1, 1])
 if b1.button("▶ Step (advance + optimize)", type="primary", use_container_width=True):
-    with st.spinner(_spinner_msg(bool(cmd and cmd.strip()))):
+    has_cmd = bool(cmd and cmd.strip())
+    with st.status(_spinner_msg(has_cmd), expanded=True) as status:
         st.session_state.last = loop.step(command=cmd or None, base_constraints=base_constraints)
+        status.update(label=_done_label(st.session_state.last), state="complete", expanded=False)
     last = st.session_state.last
+    st.toast(_done_label(last), icon="🚑")
 if b2.button("⏩ Step ×5", use_container_width=True):
-    with st.spinner("⚙️ Running 5 steps and optimizing relocations…"):
-        for _ in range(5):
+    with st.status("⚙️ Running 5 steps and optimizing relocations…", expanded=True) as status:
+        for i in range(5):
+            status.update(label=f"⚙️ Step {i+1}/5 — advancing sim and optimizing…")
             st.session_state.last = loop.step(base_constraints=base_constraints)
+        status.update(label="✅ 5 steps done", state="complete", expanded=False)
     last = st.session_state.last
 if b3.button("↺ Reset", use_container_width=True):
     st.session_state.sig = None
@@ -185,11 +195,14 @@ with st.container(border=True):
             disabled = not (asr_up and wav.exists())
             if st.button(clip["label"], key=f"clip_{clip['id']}", disabled=disabled,
                          use_container_width=True):
-                with st.spinner("🎧 Transcribing dispatch audio (local ASR), then "
-                                "interpreting the command and optimizing relocations…"):
+                with st.status("🎧 Transcribing dispatch audio (local ASR)…",
+                               expanded=True) as status:
                     raw = transcribe_bytes(wav.read_bytes())
                     norm = normalize_dispatch_text(raw, world)
+                    status.update(label=f"🧠 Heard “{norm}” — optimizing relocations…")
                     st.session_state.last = loop.step(command=norm, base_constraints=base_constraints)
+                    status.update(label=_done_label(st.session_state.last),
+                                  state="complete", expanded=False)
                 st.session_state.last_audio = {"label": clip["label"], "raw": raw, "norm": norm}
                 last = st.session_state.last
     la = st.session_state.get("last_audio")
@@ -222,6 +235,15 @@ if last:
     st.info(f"🗣️ **Agent:** {last.explanation}")
     if last.command and last.constraints:
         st.caption(f"parsed command → constraints: `{json.dumps(last.constraints)}`")
+    # operator typed a command but it mapped to no zone/lever -> tell them why
+    _zone_keys = {"protect_zones", "forbid_zones", "zone_priority",
+                  "lock_units", "force_station", "max_moves", "threshold_min"}
+    if last.command and last.command.strip() and not (set(last.constraints or {}) & _zone_keys):
+        st.warning("Couldn't map that command to a zone or rule. Name an FSA postal "
+                   "code (e.g. **M5V**), e.g. “cover M5V” or “ease off M1B”.")
+    # escalation notes from re_optimize (relaxed cap / unreachable zone explanations)
+    for note in (last.result or {}).get("notes", []):
+        st.warning(f"⚠️ {note}")
 
 st.pydeck_chart(pdk.Deck(
     map_style="road",
