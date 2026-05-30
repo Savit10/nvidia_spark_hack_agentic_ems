@@ -173,7 +173,101 @@ def _solve_once(state: C.State, world: C.World, rc: dict) -> C.OptimizeResult:
                                              coverage_before, coverage_after)}
 
 
+def _decision_rationale(state: C.State, world: C.World, rc: dict,
+                        result: C.OptimizeResult):
+    """Explain WHY cuOpt moved the specific unit it did to cover each commanded zone.
+
+    cuOpt maximizes demand-weighted coverage minus distance-weighted relocation cost.
+    For a commanded zone, that means: among the available units that can reach a
+    station covering the zone (within threshold), pick the one whose relocation is
+    cheapest — unless a cheaper unit is more valuable held elsewhere. We surface that:
+      - the chosen unit's relocation cost and where the zone's covering station(s) are,
+      - the ranked candidate units (cheapest relocation first) so the choice is legible,
+      - if the chosen unit is NOT the cheapest, a counterfactual re-solve that forces
+        the cheaper unit instead, proving the chosen plan covers more demand overall.
+    """
+    commanded = list(dict.fromkeys(list(rc["protect_zones"])
+                     + [z for z, m in rc["zone_priority"].items() if m > 1.0]))
+    moves = result.get("moves") or []
+    if not commanded or not moves:
+        return None
+    tt, stt = world["travel_time"], world["station_travel"]
+    name = lambda s: world["station_meta"][s]["name"]
+    fsa_to_z = {world["fsa_index"][z]: z for z in range(world["Z"])}
+    avail = [u for u in state["units"] if u["status"] == "available"]
+    thr = rc["threshold_min"]
+    penalty_coef = rc["move_penalty"] * (1.0 / world["Z"])
+    fam = max(float(rc["familiar_min"]), 1e-6)
+
+    out = []
+    for fsa in commanded:
+        z = fsa_to_z.get(fsa)
+        if z is None:
+            continue
+        serving = next((m for m in moves
+                        if m["reason"].startswith((f"protect:{fsa}", f"boost:{fsa}"))), None)
+        if serving is None:
+            continue  # zone was already in range; _coverage_reasoning covers that case
+        chosen_unit, chosen_to = serving["unit_id"], serving["to"]
+        cov_st = [s for s in range(world["S"]) if float(tt[s, z]) <= thr]
+        cands = []
+        for u in avail:
+            home = u["station"]
+            best = min(((float(stt[home, s]), s) for s in cov_st
+                        if float(stt[home, s]) < C.UNREACHABLE_MIN / 2), default=None)
+            if best:
+                cands.append({"unit": u["unit_id"], "reloc_min": round(best[0], 1),
+                              "obj_cost": round(penalty_coef * best[0] / fam, 4)})
+        cands.sort(key=lambda c: c["reloc_min"])
+        rank = next((i for i, c in enumerate(cands) if c["unit"] == chosen_unit), None)
+        entry = {
+            "zone": fsa, "unit": chosen_unit,
+            "from": name(serving["from"]), "to": name(chosen_to),
+            "reloc_min": serving["eta_min"],
+            "covers_at_min": round(float(tt[chosen_to, z]), 1),
+            "n_covering_stations": len(cov_st),
+            "n_candidates": len(cands),
+            "rank": (rank + 1) if rank is not None else None,
+            "cheapest": rank == 0,
+            "candidates": cands[:5],
+        }
+        if rank is not None and rank > 0 and cands:
+            alt = cands[0]
+            alt_st = min(cov_st, key=lambda s: float(stt[
+                next(u["station"] for u in avail if u["unit_id"] == alt["unit"]), s]))
+            r_alt = _solve_once(state, world,
+                                {**rc, "force_station": {**rc["force_station"],
+                                                         alt["unit"]: alt_st}})
+            entry["counterfactual"] = {
+                "alt_unit": alt["unit"], "alt_reloc_min": alt["reloc_min"],
+                "alt_total_pct": round(r_alt["coverage_after"]["covered_demand_pct"] * 100, 2),
+                "chosen_total_pct": round(result["coverage_after"]["covered_demand_pct"] * 100, 2),
+            }
+        out.append(entry)
+    return out or None
+
+
 def re_optimize(
+    state: C.State,
+    world: C.World,
+    constraints: Optional[C.Constraints] = None,
+) -> C.OptimizeResult:
+    """Solve the relocation MILP, honoring operator commands, and attach reasoning.
+
+    Thin wrapper over _re_optimize_core that also computes result["decision"] — a
+    per-commanded-zone account of WHY cuOpt picked the unit it did (candidate
+    ranking + counterfactual). See _decision_rationale.
+    """
+    rc = C.resolve_constraints(constraints, world)
+    result = _re_optimize_core(state, world, constraints)
+    try:
+        result["decision"] = _decision_rationale(state, world, rc, result)
+    except Exception:
+        result["decision"] = None
+    return result
+
+
+def _re_optimize_core(
     state: C.State,
     world: C.World,
     constraints: Optional[C.Constraints] = None,

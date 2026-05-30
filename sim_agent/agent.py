@@ -350,7 +350,32 @@ def _explain_payload(result: C.OptimizeResult, world: C.World) -> dict:
         "solve_time_ms": result["solve_time_ms"],
         "reasoning": result.get("reasoning"),
         "notes": result.get("notes", []),
+        "decision": result.get("decision"),
     }
+
+
+def _decision_story(p: dict) -> str:
+    """Why cuOpt chose THESE units to satisfy the operator's command."""
+    dec = p.get("decision")
+    if not dec:
+        return ""
+    bits = []
+    for d in dec:
+        where = (f"{d['to']} — the only post within range of {d['zone']}"
+                 if d["n_covering_stations"] == 1
+                 else f"{d['to']} (1 of {d['n_covering_stations']} posts that cover {d['zone']})")
+        why = (f"of {d['n_candidates']} available units it was the cheapest to relocate "
+               f"({d['reloc_min']:.0f} min) to {where}")
+        if d.get("cheapest") is False and d.get("counterfactual"):
+            cf = d["counterfactual"]
+            why = (f"cuOpt skipped the closer {cf['alt_unit']} ({cf['alt_reloc_min']:.0f} min) "
+                   f"because using it covers only {cf['alt_total_pct']:.0f}% of demand vs "
+                   f"{cf['chosen_total_pct']:.0f}% this way — {d['unit']} reaches {where}")
+        elif len(d.get("candidates", [])) > 1:
+            ru = d["candidates"][1]
+            why += f"; next-closest {ru['unit']} was {ru['reloc_min']:.0f} min"
+        bits.append(f"Chose {d['unit']} for {d['zone']}: {why}.")
+    return " ".join(bits)
 
 
 def _coverage_story(p: dict) -> str:
@@ -392,7 +417,11 @@ def _explain_nim(payload: dict) -> str:
         "many minutes it sits from the zone — and make clear that a zone is 'covered' "
         "when an available unit is within the response threshold of it, not when a "
         "unit is parked inside it. If a zone is still uncovered or a `notes` entry "
-        "explains a relaxed limit, say so plainly. Plain text, no JSON, no markdown."
+        "explains a relaxed limit, say so plainly. If a `decision` block is present, "
+        "state WHY that specific unit was chosen — e.g. it was the cheapest of N units "
+        "to relocate to the only post covering the zone, or (if a counterfactual is "
+        "given) a closer unit was skipped because using it would cover less demand "
+        "overall. Plain text, no JSON, no markdown."
     )
     return _chat(
         [
@@ -430,11 +459,13 @@ def _explain_template(p: dict) -> str:
     )
     story = _coverage_story(p)
     story = (" " + story) if story else ""
+    why = _decision_story(p)
+    why = (" " + why) if why else ""
     return (
         f"Recommend {p['n_moves']} move(s): "
         + "; ".join(parts)
         + f". Demand coverage rises {p['before_pct']*100:.0f}% → "
-        f"{p['after_pct']*100:.0f}%.{healed}{story} "
+        f"{p['after_pct']*100:.0f}%.{healed}{story}{why} "
         f"(solved in {p['solve_time_ms']:.0f} ms)"
     )
 
