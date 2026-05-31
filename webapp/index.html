@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TPS — Relocation Command</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+  <!-- libs (vendored locally) -->
+  <script src="vendor/globe.gl.min.js"></script>
+  <script src="vendor/deck.gl.min.js"></script>
+</head>
+<body>
+  <div id="app">
+    <!-- boot / title -->
+    <div id="boot">
+      <div class="mark">◢ TORONTO PARAMEDIC SERVICES ◣</div>
+      <h1>RELOCATION&nbsp;COMMAND</h1>
+      <div class="sub">GPU-OPTIMIZED FLEET POSITIONING · cuOpt · NEMOTRON</div>
+      <div class="bar"><i></i></div>
+    </div>
+
+    <!-- stage 1: globe -->
+    <div id="globe-stage" class="stage">
+      <div id="globe"></div>
+      <div id="globe-cap">LOCATING FLEET · TORONTO, ON</div>
+    </div>
+
+    <!-- stage 2: map -->
+    <div id="map-stage" class="stage">
+      <div id="map"></div>
+      <div id="hud">
+        <div id="topbar" class="panel">
+          <div class="title">TORONTO <b>// RELOCATION</b> <span id="mode-tag" class="mode">—</span></div>
+          <div class="right">
+            <div><div class="label">cuOpt coverage</div><div class="v" id="t-cov">—</div></div>
+            <div><div class="label">sim clock</div><div class="v" id="t-clock">—</div></div>
+            <div><div class="label">tick</div><div class="v amber" id="t-tick">—</div></div>
+          </div>
+        </div>
+
+        <div id="kpis">
+          <div class="kpi panel">
+            <div class="label">demand covered</div>
+            <div class="v" id="k-cov">—</div>
+            <div id="covbar"><i id="covbar-i"></i></div>
+          </div>
+          <div class="kpi panel">
+            <div class="label">gap zones</div><div class="v" id="k-gaps">—</div>
+          </div>
+          <div class="kpi panel">
+            <div class="label">units available</div><div class="v" id="k-avail">—</div>
+          </div>
+          <div class="kpi panel">
+            <div class="label">on-time response</div><div class="v" id="k-ontime">—</div>
+          </div>
+        </div>
+
+        <div id="roster" class="panel">
+          <div class="r-hd">
+            <span class="label">◢ unit roster</span>
+            <span id="roster-count" class="r-badge">—</span>
+          </div>
+          <div class="r-filt">
+            <span class="r-f on">▸ deployable fleet</span>
+            <span id="roster-avail" class="r-avail">—</span>
+          </div>
+          <div id="roster-list"></div>
+        </div>
+
+        <!-- inference pipeline (Claude-Code-style staged "thinking") -->
+        <div id="pipeline" class="panel">
+          <div class="hd2"><span class="label">◢ inference pipeline</span><span id="pipe-dev">· GB10</span></div>
+          <div id="pipe-steps">
+            <div class="pstep" data-step="asr">
+              <span class="ico"></span>
+              <div class="pbody"><div class="pname">Parakeet ASR</div>
+                <div class="psub">transcribe dispatch audio</div></div>
+            </div>
+            <div class="pstep" data-step="nemotron">
+              <span class="ico"></span>
+              <div class="pbody"><div class="pname">Nemotron</div>
+                <div class="psub">parse intent → constraints</div></div>
+            </div>
+            <div class="pstep" data-step="cuopt">
+              <span class="ico"></span>
+              <div class="pbody"><div class="pname">cuOpt</div>
+                <div class="psub">relocation MILP · GPU</div></div>
+            </div>
+          </div>
+        </div>
+
+        <div id="solve" class="panel">
+          <div class="label">cuOpt · relocation solver</div>
+          <div id="solve-body" class="idle">standing by · GB10</div>
+        </div>
+
+        <div id="legend" class="panel">
+          <div class="label">legend</div>
+          <div class="row"><span class="dot" style="background:#25e0a0"></span> available unit</div>
+          <div class="row"><span class="dot" style="background:#f5a524"></span> busy / on-call</div>
+          <div class="row"><span class="dot" style="background:#ff4d4d"></span> 911 incident</div>
+          <div class="row"><span class="dot" style="background:#5ab4d2"></span> candidate post</div>
+          <div class="row"><span class="sw" style="background:rgba(37,224,160,.5)"></span> covered FSA</div>
+          <div class="row"><span class="sw" style="background:rgba(255,77,77,.55)"></span> coverage gap</div>
+          <div class="row"><span class="sw" style="background:rgba(120,95,165,.6)"></span> out of network</div>
+          <div class="row"><span class="sw" style="background:linear-gradient(90deg,#f5a524,#2dd4ef)"></span> relocation</div>
+        </div>
+
+        <div id="spark"><div id="spark-in">
+          <b>ALL LOCAL · ONE DGX SPARK (GB10)</b>
+          <span>Parakeet ASR · Nemotron · cuOpt — no data left the building</span>
+        </div></div>
+
+        <div id="progress" class="panel" style="padding:0"><i id="progress-i"></i></div>
+
+        <div id="controls">
+          <button id="btn-pause">❚❚ Pause</button>
+          <button id="btn-replay">↺ Replay intro</button>
+        </div>
+
+        <!-- live dispatch-audio subtitle box (translucent, over the map) -->
+        <div id="subtitle">
+          <div class="sub-hd">
+            <span class="sub-eq"><i></i><i></i><i></i><i></i><i></i></span>
+            <span class="sub-tag">LIVE DISPATCH · PARAKEET ASR</span>
+          </div>
+          <div id="sub-text"></div>
+        </div>
+
+        <div id="agent" class="panel">
+          <div class="hd"><span class="who">◢ NEMOTRON AGENT</span><span class="tick" id="a-tick"></span></div>
+          <div id="dispatch-bar"><span class="db-label">▸ incoming calls:</span><span id="dispatch-chips"></span></div>
+          <div class="cmd" id="a-cmd"></div>
+          <div class="body" id="a-body">Standing by…</div>
+          <div id="a-notes" style="display:none"></div>
+          <div id="cmdbar">
+            <input id="cmd-in" autocomplete="off"
+              placeholder='operator command, e.g. "keep M5V covered, no more than 2 moves"' />
+            <button id="cmd-send">SEND ▸</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
