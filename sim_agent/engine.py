@@ -50,6 +50,7 @@ class Simulation:
         calls_per_hour: float = 18.0,
         mean_service_min: float = 40.0,
         seed: int = 0,
+        incident_profiles: "str | dict | None" = None,
     ):
         self.world = world
         self.rng = np.random.default_rng(seed)
@@ -60,6 +61,10 @@ class Simulation:
         self.rate_per_min = calls_per_hour / 60.0
         self.mean_service = mean_service_min
         self.threshold = float(world["threshold_min"])
+
+        # optional real-data incident profiles (type/priority per FSA) — when
+        # absent, call records keep their original FSA-only shape (backward compat).
+        self._load_incident_profiles(incident_profiles)
 
         self.demand = np.array(
             [world["fsa_meta"][z]["demand_weight"] for z in range(world["Z"])]
@@ -135,6 +140,48 @@ class Simulation:
     def _sample_zone(self) -> int:
         return int(self.rng.choice(self.world["Z"], p=self.demand))
 
+    # ----------------------------------------------- incident enrichment
+    def _load_incident_profiles(self, profiles) -> None:
+        """Prep per-FSA type + per-type priority samplers from incident_profiles.json
+        (path or dict). Sets self._profiles=None to disable enrichment if absent."""
+        self._profiles = None
+        if profiles is None:
+            return
+        if isinstance(profiles, str):
+            import json
+            with open(profiles) as f:
+                profiles = json.load(f)
+        self._labels = profiles.get("_labels", {})
+
+        def _arrs(dist: dict):
+            keys = list(dist.keys())
+            p = np.array([dist[k] for k in keys], dtype="float64")
+            return keys, (p / p.sum() if p.sum() > 0 else p)
+
+        self._fsa_types = {fsa: _arrs(v["types"])
+                           for fsa, v in profiles.get("fsa", {}).items() if v.get("types")}
+        self._global_types = _arrs(profiles["_global"]["types"])
+        self._prio_by_type = {t: _arrs(d) for t, d in profiles.get("priority_by_type", {}).items()}
+        self._profiles = profiles
+
+    def _sample_incident(self, z: int):
+        """(incident_type, priority_label) sampled from real per-FSA / per-type
+        distributions using the sim RNG (keeps determinism). ('', '') if disabled."""
+        if self._profiles is None:
+            return "", ""
+        fsa = self.world["fsa_index"][z]
+        types, tprob = self._fsa_types.get(fsa, self._global_types)
+        itype = str(self.rng.choice(types, p=tprob))
+        pr = self._prio_by_type.get(itype)
+        prio = str(self.rng.choice(pr[0], p=pr[1])) if pr else ""
+        return itype, self._labels.get(prio, prio)
+
+    def _jitter_latlon(self, z: int):
+        """A plausible incident point inside FSA z: centroid + small gaussian (~1km)."""
+        m = self.world["fsa_meta"][z]
+        return (round(m["lat"] + float(self.rng.normal(0, 0.008)), 5),
+                round(m["lon"] + float(self.rng.normal(0, 0.011)), 5))
+
     def _nearest_available(self, z: int) -> tuple[int | None, float]:
         """(unit list-index, travel_time) of closest available unit to zone z."""
         tt = self.world["travel_time"]
@@ -153,7 +200,16 @@ class Simulation:
         z = self._sample_zone()
         i, drive = self._nearest_available(z)
 
-        record = {"t": self.t, "zone": self.world["fsa_index"][z], "served": False}
+        fsa = self.world["fsa_index"][z]
+        record = {"t": round(self.t, 2), "zone": fsa, "served": False}
+        # enrich with real-data incident type/priority + a map point (no-op if
+        # profiles weren't loaded — keeps the original record shape)
+        if self._profiles is not None:
+            itype, prio_label = self._sample_incident(z)
+            lat, lon = self._jitter_latlon(z)
+            record.update(incident_type=itype, priority_label=prio_label,
+                          lat=lat, lon=lon,
+                          label=f"{prio_label} · {itype} · {fsa}")
 
         if i is None or drive >= C.UNREACHABLE_MIN:
             self.stats["missed"] += 1
@@ -172,6 +228,12 @@ class Simulation:
             else:
                 self.stats["late"] += 1
             record.update(served=True, unit=unit["unit_id"], response_min=drive)
+            # origin + return time so the frontend can animate the dispatch trip
+            # (unit drives station -> scene -> back). Only when enriched.
+            if self._profiles is not None:
+                sm = self.world["station_meta"][unit["station"]]
+                record.update(from_lat=sm["lat"], from_lon=sm["lon"],
+                              busy_until=round(unit["busy_until"], 2))
 
         self._schedule_next_call()
         return record
@@ -180,6 +242,61 @@ class Simulation:
         unit = self.units[payload["unit_index"]]
         unit["status"] = "available"
         unit["busy_until"] = None  # returns to (possibly relocated) post
+
+    def dispatch_incident(self, zone, n_units: int = 2,
+                          priority: str = "DELTA", reason: str = "major incident") -> dict:
+        """Operator-declared EMERGENCY: commit the n fastest-responding available
+        units to a scene in `zone` right now (mark them busy en route). Returns a
+        summary incl. trip records (station -> scene) the frontend animates, so the
+        coverage re-optimization afterward operates on the depleted fleet.
+
+        Units are chosen by response time to the scene (EMS dispatches the fastest
+        units); cuOpt then restructures the *remaining* fleet to restore coverage.
+        """
+        z = (self.world["fsa_index"].index(zone)
+             if isinstance(zone, str) and zone in self.world["fsa_index"] else
+             (zone if isinstance(zone, int) else None))
+        if z is None:
+            return {"zone": str(zone), "requested": n_units, "dispatched": [],
+                    "response_min": [], "shortfall": n_units, "records": [], "reason": reason}
+
+        tt = self.world["travel_time"]
+        fsa = self.world["fsa_index"][z]
+        lat, lon = self._jitter_latlon(z)
+        ranked = sorted(
+            ((float(tt[u["station"], z]), i) for i, u in enumerate(self.units)
+             if u["status"] == "available" and float(tt[u["station"], z]) < C.UNREACHABLE_MIN),
+            key=lambda x: x[0])
+        chosen = ranked[: max(1, int(n_units))]
+
+        records = []
+        for drive, i in chosen:
+            unit = self.units[i]
+            service = float(self.rng.exponential(self.mean_service))
+            unit["status"] = "busy"
+            unit["busy_until"] = self.t + drive + service
+            self._push(unit["busy_until"], UNIT_FREE, {"unit_index": i})
+            self.stats["calls"] += 1
+            self.stats["served"] += 1
+            self.stats["response_times"].append(drive)
+            if drive <= self.threshold:
+                self.stats["on_time"] += 1
+            else:
+                self.stats["late"] += 1
+            sm = self.world["station_meta"][unit["station"]]
+            records.append({
+                "t": round(self.t, 2), "zone": fsa, "served": True,
+                "unit": unit["unit_id"], "response_min": drive,
+                "incident_type": reason, "priority_label": priority,
+                "lat": lat, "lon": lon, "from_lat": sm["lat"], "from_lon": sm["lon"],
+                "busy_until": round(unit["busy_until"], 2),
+                "label": f"{priority} · {reason} · {fsa}"})
+        return {"zone": fsa, "requested": int(n_units),
+                "dispatched": [r["unit"] for r in records],
+                "response_min": [round(r["response_min"], 1) for r in records],
+                "shortfall": max(0, int(n_units) - len(chosen)),
+                "records": records, "reason": reason, "priority": priority,
+                "lat": lat, "lon": lon}
 
     # ------------------------------------------------------------------- API
     def run_until(self, t_target: float) -> list[dict]:

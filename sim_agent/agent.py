@@ -24,8 +24,18 @@ import contracts as C
 NIM_BASE_URL = os.environ.get("NIM_BASE_URL", "http://localhost:8000/v1")
 NIM_MODEL = os.environ.get("NIM_MODEL", "nvidia/llama-3.1-nemotron-70b-instruct")
 NIM_TIMEOUT = float(os.environ.get("NIM_TIMEOUT", "30"))
+# Bearer token for hosted NIMs / build.nvidia.com (nvapi-...). A bare local NIM
+# container needs no auth, so this stays unset and no header is sent.
+NIM_API_KEY = os.environ.get("NIM_API_KEY") or os.environ.get("NVIDIA_API_KEY")
 
-_FSA_RE = re.compile(r"\b([A-Z]\d[A-Z])\b")
+
+def _auth_headers() -> dict:
+    h = {"Content-Type": "application/json"}
+    if NIM_API_KEY:
+        h["Authorization"] = f"Bearer {NIM_API_KEY}"
+    return h
+
+_FSA_RE = re.compile(r"\b([A-Za-z]\d[A-Za-z])\b")  # case-insensitive; .upper() the match
 _UNIT_RE = re.compile(r"\bAMB[_ ]?(\d{1,2})\b", re.IGNORECASE)
 
 
@@ -50,22 +60,33 @@ def build_glossary(world: C.World) -> dict:
 # --------------------------------------------------------------------------- #
 def nim_available() -> bool:
     try:
-        req = urllib.request.Request(f"{NIM_BASE_URL}/models")
+        req = urllib.request.Request(f"{NIM_BASE_URL}/models", headers=_auth_headers())
         with urllib.request.urlopen(req, timeout=3) as r:
             return r.status == 200
     except Exception:
         return False
 
 
-def _chat(messages: list[dict], temperature: float = 0.0) -> str:
-    """One OpenAI-compatible chat completion. Raises on any transport error."""
+def _chat(messages: list[dict], temperature: float = 0.0,
+          max_tokens: int = 256) -> str:
+    """One OpenAI-compatible chat completion. Raises on any transport error.
+
+    max_tokens is capped deliberately: a reasoning-style local model (e.g.
+    nemotron-3-super) will otherwise emit a long trace and blow past the demo's
+    latency budget. Parsing needs a tiny JSON; explaining needs 2-4 sentences."""
     body = json.dumps(
-        {"model": NIM_MODEL, "messages": messages, "temperature": temperature}
+        {"model": NIM_MODEL, "messages": messages, "temperature": temperature,
+         "max_tokens": max_tokens,
+         # Disable the reasoning trace on reasoning models (e.g. nemotron-3-super
+         # via Ollama). Without this the chain-of-thought fills the token budget
+         # and lands in a separate `reasoning` field, leaving `content` empty.
+         # Unknown to plain OpenAI servers, which ignore extra fields.
+         "think": False}
     ).encode()
     req = urllib.request.Request(
         f"{NIM_BASE_URL}/chat/completions",
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers=_auth_headers(),
     )
     with urllib.request.urlopen(req, timeout=NIM_TIMEOUT) as r:
         data = json.loads(r.read())
@@ -108,32 +129,182 @@ _INTENT_GUIDE = (
 )
 
 
+# Records which path the most recent parse/explain actually took, so callers can
+# show the operator whether Nemotron or the deterministic fallback was used.
+LAST_PARSE_SOURCE: str = "none"
+LAST_EXPLAIN_SOURCE: str = "none"
+
+
 def parse_command(text: str, world: C.World) -> C.Constraints:
     """Natural-language operator command -> Constraints object (§3)."""
+    global LAST_PARSE_SOURCE
     if not text or not text.strip():
+        LAST_PARSE_SOURCE = "none"
         return {}
     if nim_available():
         try:
-            return _parse_command_nim(text, world)
+            out = _parse_command_nim(text, world)
+            LAST_PARSE_SOURCE = "nemotron"
+            return out
         except Exception:
             pass  # fall through to rules
+    LAST_PARSE_SOURCE = "fallback"
     return _parse_command_rules(text, world)
 
 
-def _parse_command_nim(text: str, world: C.World) -> C.Constraints:
-    glossary = build_glossary(world)
+# --------------------------------------------------------------------------- #
+#  Intent: distinguish an active EMERGENCY (dispatch units to a scene now) from
+#  a COVERAGE request (reposition idle units to keep an area ready). This is the
+#  classification Nemotron is uniquely good at — emergencies and coverage commands
+#  read similarly but trigger completely different actions downstream.
+# --------------------------------------------------------------------------- #
+_EMERGENCY_KW = (
+    "collision", "crash", "mvc", "multi-vehicle", "multi vehicle", "pile-up", "pileup",
+    "fire", "explosion", "blast", "mci", "mass casualty", "mass-casualty", "shooting",
+    "stabbing", "derailment", "structure fire", "major incident", "active incident",
+    "send units", "send help", "roll ", "dispatch ", "scene", "victims", "casualties",
+)
+_NUNITS_RE = re.compile(
+    r"(?:send|roll|dispatch|need|get|want)\s+(\d+)"
+    r"|(\d+)\s*(?:units|trucks|ambulances|medics|cars|crews|rigs|paramedics)",
+    re.IGNORECASE,
+)
+
+
+def parse_intent(text: str, world: C.World) -> dict:
+    """Classify the operator's command and return a structured intent:
+
+        {"intent": "emergency"|"coverage",
+         "dispatch": {"zone": FSA, "n_units": int, "reason": str, "priority": str} | None,
+         "constraints": Constraints}
+
+    'emergency' => commit units to a scene now (loop dispatches, then re-optimizes
+    the rest). 'coverage' => the existing relocation-constraints path. Uses Nemotron
+    when available, else a deterministic keyword fallback so the demo always runs."""
+    global LAST_PARSE_SOURCE
+    if not text or not text.strip():
+        LAST_PARSE_SOURCE = "none"
+        return {"intent": "coverage", "dispatch": None, "constraints": {}}
+    if nim_available():
+        try:
+            out = _parse_intent_nim(text, world)
+            LAST_PARSE_SOURCE = "nemotron"
+            return out
+        except Exception:
+            pass
+    LAST_PARSE_SOURCE = "fallback"
+    return _parse_intent_rules(text, world)
+
+
+_INTENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "intent": {"type": "string", "enum": ["emergency", "coverage"]},
+        "dispatch": {
+            "type": ["object", "null"],
+            "properties": {
+                "zone": {"type": "string"},
+                "n_units": {"type": "integer"},
+                "reason": {"type": "string"},
+                "priority": {"type": "string"},
+            },
+        },
+        "constraints": _CONSTRAINTS_SCHEMA,
+    },
+}
+
+
+def _parse_intent_nim(text: str, world: C.World) -> dict:
+    glossary = {"fsa_codes": list(world["fsa_index"])}
     system = (
+        "detailed thinking off\n"
+        "You are an ambulance dispatch supervisor. Classify the operator's command "
+        "and return ONLY a JSON object, no prose. Schema:\n"
+        + json.dumps(_INTENT_SCHEMA)
+        + "\nDecide intent:\n"
+        "- 'emergency': an ACTIVE incident needing units sent to a scene NOW "
+        "(collision, fire, mass-casualty, 'send/roll N units to <zone>'). Fill "
+        "`dispatch` with the FSA zone, n_units (default 2 if unspecified, more for "
+        "major incidents), a short reason, and a priority (DELTA/ECHO = "
+        "life-threatening, CHARLIE/BRAVO/ALPHA = lower). Leave constraints empty.\n"
+        "- 'coverage': a readiness/positioning request (keep/ensure/boost/ease an "
+        "area's coverage). Set dispatch=null and fill `constraints`:\n"
+        + _INTENT_GUIDE
+        + "Resolve FSA postal codes using this glossary:\n"
+        + json.dumps(glossary)
+    )
+    raw = _chat(
+        [{"role": "system", "content": system}, {"role": "user", "content": text}],
+        max_tokens=400,
+    )
+    obj = _extract_json(raw)
+    return _coerce_intent(obj, text, world)
+
+
+def _coerce_intent(obj: dict, text: str, world: C.World) -> dict:
+    valid_fsa = set(world["fsa_index"])
+    d = obj.get("dispatch") if isinstance(obj.get("dispatch"), dict) else None
+    if obj.get("intent") == "emergency" and d:
+        zone = str(d.get("zone", "")).upper()
+        if zone not in valid_fsa:
+            zone = next((z.group(1).upper() for z in [_FSA_RE.search(text)] if z
+                         and z.group(1).upper() in valid_fsa), None)
+        n = _as_int(d.get("n_units")) or 2
+        if zone:
+            return {"intent": "emergency", "constraints": {},
+                    "dispatch": {"zone": zone, "n_units": max(1, min(int(n), world["S"])),
+                                 "reason": str(d.get("reason") or "major incident"),
+                                 "priority": str(d.get("priority") or "DELTA").upper()}}
+    return {"intent": "coverage", "dispatch": None,
+            "constraints": _coerce_constraints(obj.get("constraints", obj), world)}
+
+
+def _parse_intent_rules(text: str, world: C.World) -> dict:
+    """Keyword fallback: emergency if incident words / 'send N units' appear."""
+    low = text.lower()
+    valid_fsa = set(world["fsa_index"])
+    is_emergency = any(k in low for k in _EMERGENCY_KW)
+    if is_emergency:
+        m = _FSA_RE.search(text)
+        zone = m.group(1).upper() if m and m.group(1).upper() in valid_fsa else None
+        if zone:
+            nm = _NUNITS_RE.search(text)
+            n = int(next(g for g in nm.groups() if g)) if nm else (
+                3 if any(w in low for w in ("multiple", "several", "mass", "mci", "major")) else 2)
+            reason = next((k for k in _EMERGENCY_KW if k.strip() in low and len(k.strip()) > 4),
+                          "major incident")
+            return {"intent": "emergency", "constraints": {},
+                    "dispatch": {"zone": zone, "n_units": max(1, min(n, world["S"])),
+                                 "reason": reason, "priority": "DELTA"}}
+    return {"intent": "coverage", "dispatch": None,
+            "constraints": _parse_command_rules(text, world)}
+
+
+def _parse_command_nim(text: str, world: C.World) -> C.Constraints:
+    # Send ONLY the FSA codes, not the full station glossary. The big glossary
+    # (every station name + id) blows up the prompt and makes smaller reasoning
+    # models (e.g. nemotron3:33b) return empty content; FSA codes are all the
+    # zone-based dispatcher commands need. Unit ids (AMB_NN) come straight from
+    # the command text, so no glossary is required for lock_units.
+    glossary = {"fsa_codes": list(world["fsa_index"])}
+    system = (
+        # Nemotron reasoning toggle: answer directly, no chain-of-thought trace
+        # (keeps latency in the demo budget and avoids truncated/empty output).
+        "detailed thinking off\n"
         "You translate an ambulance dispatcher's English command into a JSON "
         "Constraints object for a relocation optimizer. Respond with ONLY the "
         "JSON object, no prose. Schema:\n"
         + json.dumps(_CONSTRAINTS_SCHEMA)
         + _INTENT_GUIDE
         + "Omit fields the command does not mention. "
-        "Resolve station names and FSA postal codes using this glossary:\n"
+        "Resolve FSA postal codes using this glossary:\n"
         + json.dumps(glossary)
     )
+    # max_tokens deliberately generous: even with think disabled, the model needs
+    # headroom before it emits the JSON; too tight a cap yields empty content.
     raw = _chat(
-        [{"role": "system", "content": system}, {"role": "user", "content": text}]
+        [{"role": "system", "content": system}, {"role": "user", "content": text}],
+        max_tokens=400,
     )
     obj = _extract_json(raw)
     return _coerce_constraints(obj, world)
@@ -190,7 +361,7 @@ def _parse_command_rules(text: str, world: C.World) -> C.Constraints:
         d = _clause_dir(clause.lower())
         if d:
             last_dir = d
-        czones = [z for z in _FSA_RE.findall(clause) if z in valid_fsa]
+        czones = [z.upper() for z in _FSA_RE.findall(clause) if z.upper() in valid_fsa]
         if not czones:
             continue
         use = d or last_dir or "cover"          # a bare "...M5V" defaults to coverage intent
@@ -275,11 +446,11 @@ def _coerce_constraints(obj: dict, world: C.World) -> C.Constraints:
     if mm is not None:
         out["max_moves"] = mm
 
-    zones = [str(z) for z in _as_list(obj.get("protect_zones")) if str(z) in valid_fsa]
+    zones = [str(z).upper() for z in _as_list(obj.get("protect_zones")) if str(z).upper() in valid_fsa]
     if zones:
         out["protect_zones"] = zones
 
-    forbid = [str(z) for z in _as_list(obj.get("forbid_zones")) if str(z) in valid_fsa]
+    forbid = [str(z).upper() for z in _as_list(obj.get("forbid_zones")) if str(z).upper() in valid_fsa]
     if forbid:
         out["forbid_zones"] = forbid
 
@@ -290,8 +461,8 @@ def _coerce_constraints(obj: dict, world: C.World) -> C.Constraints:
         zp = {}
         for k, v in obj["zone_priority"].items():
             fv = _as_float(v)
-            if str(k) in valid_fsa and fv is not None and fv > 0 and fv != 1.0:
-                zp[str(k)] = min(max(fv, 0.05), 10.0)
+            if str(k).upper() in valid_fsa and fv is not None and fv > 0 and fv != 1.0:
+                zp[str(k).upper()] = min(max(fv, 0.05), 10.0)
         if zp:
             out["zone_priority"] = zp
 
@@ -314,12 +485,16 @@ def explain_result(result: C.OptimizeResult, world: C.World, use_llm: bool = Tru
 
     `use_llm=False` forces the instant template (skips the Nemotron round-trip) —
     used for fast auto-play ticks; the LLM is reserved for operator commands."""
+    global LAST_EXPLAIN_SOURCE
     payload = _explain_payload(result, world)
     if use_llm and nim_available():
         try:
-            return _explain_nim(payload)
+            out = _explain_nim(payload)
+            LAST_EXPLAIN_SOURCE = "nemotron"
+            return out
         except Exception:
             pass
+    LAST_EXPLAIN_SOURCE = "template"
     return _explain_template(payload)
 
 
@@ -347,6 +522,7 @@ def _explain_payload(result: C.OptimizeResult, world: C.World) -> dict:
         "before_pct": before,
         "after_pct": after,
         "gaps_healed": healed,
+        "gaps_after": list(result["coverage_after"]["gaps"]),
         "solve_time_ms": result["solve_time_ms"],
         "reasoning": result.get("reasoning"),
         "notes": result.get("notes", []),
@@ -408,27 +584,51 @@ def _coverage_story(p: dict) -> str:
             f"not a unit parked inside the zone.)" + note_txt)
 
 
+def _explain_facts(p: dict) -> str:
+    """Compact, pre-digested fact line for the LLM to phrase.
+
+    We deliberately do NOT hand the model the full structured result (moves +
+    reasoning + decision + counterfactual JSON): a reasoning model like
+    nemotron-3-super will chew on that with a long chain-of-thought, blowing the
+    latency budget and often emptying `content`. A short fact string keeps it to a
+    fast, clean 2-sentence summary. The rich per-zone/decision detail still lives
+    in _explain_template (used for auto-play ticks)."""
+    moves = "; ".join(f"{m['unit']}->{m['to']} ({m['eta_min']:.0f}min)"
+                      for m in p["moves"]) or "none"
+    # Use the FULL post-move gap list (not just operator-commanded zones) so the
+    # model can never claim "no zones uncovered" when gaps actually remain.
+    gaps = p.get("gaps_after", [])
+    ngaps = len(gaps)
+    commanded_uncov = [z["fsa"] for z in (p.get("reasoning") or {}).get("zones", [])
+                       if not z["covered_after"]]
+    sample = commanded_uncov or gaps[:4]
+    parts = [f"{p['n_moves']} relocations ({moves}).",
+             f"Coverage {p['before_pct']*100:.0f}%->{p['after_pct']*100:.0f}%, "
+             f"healed {len(p['gaps_healed'])} gaps."]
+    if ngaps:
+        ex = f" (e.g. {', '.join(sample)})" if sample else ""
+        parts.append(f"{ngaps} zone(s) still uncovered{ex}.")
+    else:
+        parts.append("All demand zones are covered.")
+    parts.extend(p.get("notes", []))
+    return " ".join(parts)
+
+
 def _explain_nim(payload: dict) -> str:
     system = (
-        "You are an ambulance dispatch assistant. Given a JSON relocation result, "
-        "write a concise 2-4 sentence explanation for the operator: what to move, "
-        "and how coverage improves. If a `reasoning` block is present, explain for "
-        "each commanded zone HOW it became covered — name the unit, its post, and how "
-        "many minutes it sits from the zone — and make clear that a zone is 'covered' "
-        "when an available unit is within the response threshold of it, not when a "
-        "unit is parked inside it. If a zone is still uncovered or a `notes` entry "
-        "explains a relaxed limit, say so plainly. If a `decision` block is present, "
-        "state WHY that specific unit was chosen — e.g. it was the cheapest of N units "
-        "to relocate to the only post covering the zone, or (if a counterfactual is "
-        "given) a closer unit was skipped because using it would cover less demand "
-        "overall. Plain text, no JSON, no markdown."
+        "You are an ambulance dispatch assistant. In 2 short sentences, summarize "
+        "the relocation result for the operator: the overall coverage change and the "
+        "number of zones still uncovered. State the uncovered count exactly as given "
+        "in the facts; NEVER say 'no zones uncovered' unless the facts say all zones "
+        "are covered. Do not enumerate every move. No preamble, no markdown."
     )
     return _chat(
         [
             {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(payload)},
+            {"role": "user", "content": _explain_facts(payload)},
         ],
-        temperature=0.3,
+        temperature=0.2,
+        max_tokens=400,
     ).strip()
 
 
